@@ -5,9 +5,8 @@
 use core::fmt;
 use core::ops::{Div, Mul};
 
-use super::Weight;
-use crate::prelude::*;
-use crate::Amount;
+use crate::amount::Amount;
+use crate::blockdata::weight::Weight;
 
 /// Represents fee rate.
 ///
@@ -190,6 +189,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn from_sat_per_vb_unchecked_panic_test() { FeeRate::from_sat_per_vb_unchecked(u64::MAX); }
 

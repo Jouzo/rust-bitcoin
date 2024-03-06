@@ -12,13 +12,13 @@
 use core::fmt;
 use core::marker::PhantomData;
 
+use io::{BufRead, Read, Write};
 use serde::de::{SeqAccess, Unexpected, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserializer, Serializer};
 
 use super::encode::Error as ConsensusError;
 use super::{Decodable, Encodable};
-use crate::io;
 
 /// Hex-encoding strategy
 pub struct Hex<Case = hex::Lower>(PhantomData<Case>)
@@ -66,7 +66,7 @@ pub mod hex {
         }
     }
 
-    // TODO measure various sizes and determine the best value
+    // We just guessed at a reasonably sane value.
     const HEX_BUF_SIZE: usize = 512;
 
     /// Hex byte encoder.
@@ -98,7 +98,6 @@ pub mod hex {
     }
 
     // Newtypes to hide internal details.
-    // TODO: statically prove impossible cases
 
     /// Error returned when a hex string decoder can't be created.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,7 +268,7 @@ impl<'a, W: fmt::Write, E: EncodeBytes> IoWrapper<'a, W, E> {
     fn actually_flush(&mut self) -> fmt::Result { self.encoder.flush(&mut self.writer) }
 }
 
-impl<'a, W: fmt::Write, E: EncodeBytes> io::Write for IoWrapper<'a, W, E> {
+impl<'a, W: fmt::Write, E: EncodeBytes> Write for IoWrapper<'a, W, E> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self.encoder.encode_chunk(&mut self.writer, bytes) {
             Ok(()) => Ok(bytes.len()),
@@ -339,7 +338,7 @@ struct BinWriter<S: SerializeSeq> {
     error: Option<S::Error>,
 }
 
-impl<S: SerializeSeq> io::Write for BinWriter<S> {
+impl<S: SerializeSeq> Write for BinWriter<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.write_all(buf).map(|_| buf.len()) }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
@@ -420,11 +419,12 @@ where
 
 struct IterReader<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> {
     iterator: core::iter::Fuse<I>,
+    buf: Option<u8>,
     error: Option<E>,
 }
 
 impl<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> IterReader<E, I> {
-    fn new(iterator: I) -> Self { IterReader { iterator: iterator.fuse(), error: None } }
+    fn new(iterator: I) -> Self { IterReader { iterator: iterator.fuse(), buf: None, error: None } }
 
     fn decode<T: Decodable>(mut self) -> Result<T, DecodeError<E>> {
         let result = T::consensus_decode(&mut self);
@@ -442,9 +442,18 @@ impl<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> IterReader<E, I> {
     }
 }
 
-impl<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> io::Read for IterReader<E, I> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+impl<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> Read for IterReader<E, I> {
+    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
         let mut count = 0;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if let Some(first) = self.buf.take() {
+            buf[0] = first;
+            buf = &mut buf[1..];
+            count += 1;
+        }
         for (dst, src) in buf.iter_mut().zip(&mut self.iterator) {
             match src {
                 Ok(byte) => *dst = byte,
@@ -457,6 +466,34 @@ impl<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> io::Read for IterReader<E
             count += 1;
         }
         Ok(count)
+    }
+}
+
+impl<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> BufRead for IterReader<E, I> {
+    fn fill_buf(&mut self) -> Result<&[u8], io::Error> {
+        // matching on reference rather than using `ref` confuses borrow checker
+        if let Some(ref byte) = self.buf {
+            Ok(core::slice::from_ref(byte))
+        } else {
+            match self.iterator.next() {
+                Some(Ok(byte)) => {
+                    self.buf = Some(byte);
+                    Ok(core::slice::from_ref(self.buf.as_ref().expect("we've just filled it")))
+                },
+                Some(Err(error)) => {
+                    self.error = Some(error);
+                    Err(io::ErrorKind::Other.into())
+                },
+                None => Ok(&[]),
+            }
+        }
+    }
+
+    fn consume(&mut self, len: usize) {
+        debug_assert!(len <= 1);
+        if len > 0 {
+            self.buf = None;
+        }
     }
 }
 

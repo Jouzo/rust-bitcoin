@@ -22,8 +22,6 @@
 //! * `serde` - (dependency), implements `serde`-based serialization and
 //!                 deserialization.
 //! * `secp-lowmemory` - optimizations for low-memory devices.
-//! * `no-std` - enables additional features required for this crate to be usable
-//!              without std. Does **not** disable `std`.
 //! * `bitcoinconsensus-std` - enables `std` in `bitcoinconsensus` and communicates it
 //!                            to this crate so it knows how to implement
 //!                            `std::error::Error`. At this time there's a hack to
@@ -32,17 +30,15 @@
 
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 // Experimental features we need.
-#![cfg_attr(bench, feature(test))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-// Coding conventions
+#![cfg_attr(bench, feature(test))]
+// Coding conventions.
 #![warn(missing_docs)]
 // Instead of littering the codebase for non-fuzzing code just globally allow.
 #![cfg_attr(fuzzing, allow(dead_code, unused_imports))]
-// Exclude clippy lints we don't think are valuable
+// Exclude lints we don't think are valuable.
 #![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
-
-#[cfg(not(any(feature = "std", feature = "no-std")))]
-compile_error!("at least one of the `std` or `no-std` features must be enabled");
+#![allow(clippy::manual_range_contains)] // More readable than clippy's format.
 
 // Disable 16-bit support at least for now as we can't guarantee it yet.
 #[cfg(target_pointer_width = "16")]
@@ -61,18 +57,21 @@ extern crate alloc;
 /// Encodes and decodes base64 as bytes or utf8.
 pub extern crate base64;
 
-/// Encodes and decodes the Bech32 forrmat.
-pub extern crate bech32;
+/// Bitcoin base58 encoding and decoding.
+pub extern crate base58;
 
-#[cfg(feature = "bitcoinconsensus")]
-/// Bitcoin's libbitcoinconsensus with Rust binding.
-pub extern crate bitcoinconsensus;
-
-/// Rust implementation of cryptographic hash function algorithems.
+/// Rust implementation of cryptographic hash function algorithms.
 pub extern crate hashes;
 
 /// Re-export the `hex-conservative` crate.
 pub extern crate hex;
+
+/// Re-export the `bitcoin-io` crate.
+pub extern crate io;
+
+/// Re-export the `ordered` crate.
+#[cfg(feature = "ordered")]
+pub extern crate ordered;
 
 /// Rust wrapper library for Pieter Wuille's libsecp256k1.  Implements ECDSA and BIP 340 signatures
 /// for the SECG elliptic curve group secp256k1 and related utilities.
@@ -93,8 +92,6 @@ mod serde_utils;
 #[macro_use]
 pub mod p2p;
 pub mod address;
-pub mod amount;
-pub mod base58;
 pub mod bip152;
 pub mod bip158;
 pub mod bip32;
@@ -113,15 +110,14 @@ pub mod sign_message;
 pub mod string;
 pub mod taproot;
 
-pub use bitcoin_io::io;
-
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
 pub use crate::{
-    address::{Address, AddressType},
+    address::{Address, AddressType, KnownHrp},
     amount::{Amount, Denomination, SignedAmount},
+    bip158::{FilterHash, FilterHeader},
     bip32::XKeyIdentifier,
-    blockdata::block::{self, Block},
+    blockdata::block::{self, Block, BlockHash, TxMerkleNode, WitnessMerkleNode, WitnessCommitment},
     blockdata::constants,
     blockdata::fee_rate::FeeRate,
     blockdata::locktime::{self, absolute, relative},
@@ -129,44 +125,23 @@ pub use crate::{
     blockdata::script::witness_program::{self, WitnessProgram},
     blockdata::script::witness_version::{self, WitnessVersion},
     blockdata::script::{self, Script, ScriptBuf, ScriptHash, WScriptHash},
-    blockdata::transaction::{self, OutPoint, Sequence, Transaction, TxIn, TxOut},
+    blockdata::transaction::{self, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Wtxid},
     blockdata::weight::Weight,
     blockdata::witness::{self, Witness},
     consensus::encode::VarInt,
     crypto::ecdsa,
-    crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, WPubkeyHash, XOnlyPublicKey},
+    crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, CompressedPublicKey, WPubkeyHash, XOnlyPublicKey},
     crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
-    hash_types::{BlockHash, FilterHash, FilterHeader, TxMerkleNode, Txid, WitnessCommitment, Wtxid},
     merkle_tree::MerkleBlock,
-    network::Network,
+    network::{Network, NetworkKind},
     pow::{CompactTarget, Target, Work},
     psbt::Psbt,
     sighash::{EcdsaSighashType, TapSighashType},
     taproot::{TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash, TapTweakHash, TapTweakTag},
 };
 
-#[cfg(not(feature = "std"))]
-mod io_extras {
-    use crate::io;
-
-    /// A writer which will move data into the void.
-    pub struct Sink {
-        _priv: (),
-    }
-
-    /// Creates an instance of a writer which will successfully consume all data.
-    pub const fn sink() -> Sink { Sink { _priv: () } }
-
-    impl io::Write for Sink {
-        #[inline]
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> { Ok(buf.len()) }
-
-        #[inline]
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
-    }
-}
-
 #[rustfmt::skip]
+#[allow(unused_imports)]
 mod prelude {
     #[cfg(all(not(feature = "std"), not(test)))]
     pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
@@ -175,7 +150,7 @@ mod prelude {
     pub use alloc::sync;
 
     #[cfg(any(feature = "std", test))]
-    pub use std::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc, sync};
+    pub use std::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, rc, sync};
 
     #[cfg(all(not(feature = "std"), not(test)))]
     pub use alloc::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
@@ -183,11 +158,39 @@ mod prelude {
     #[cfg(any(feature = "std", test))]
     pub use std::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
-    #[cfg(feature = "std")]
     pub use crate::io::sink;
 
-    #[cfg(not(feature = "std"))]
-    pub use crate::io_extras::sink;
-
     pub use hex::DisplayHex;
+}
+
+pub mod amount {
+    //! Bitcoin amounts.
+    //!
+    //! This module mainly introduces the [Amount] and [SignedAmount] types.
+    //! We refer to the documentation on the types for more information.
+
+    use crate::consensus::{encode, Decodable, Encodable};
+    use crate::io::{BufRead, Write};
+
+    #[rustfmt::skip]            // Keep public re-exports separate.
+    #[doc(inline)]
+    pub use units::amount::{
+        Amount, CheckedSum, Denomination, Display, ParseAmountError, SignedAmount,
+    };
+    #[cfg(feature = "serde")]
+    pub use units::amount::serde;
+
+    impl Decodable for Amount {
+        #[inline]
+        fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+            Ok(Amount::from_sat(Decodable::consensus_decode(r)?))
+        }
+    }
+
+    impl Encodable for Amount {
+        #[inline]
+        fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+            self.to_sat().consensus_encode(w)
+        }
+    }
 }

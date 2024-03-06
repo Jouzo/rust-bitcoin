@@ -65,21 +65,21 @@
 //! # fn main() {}
 //! ```
 
-// Coding conventions
-#![warn(missing_docs)]
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+
 // Experimental features we need.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(bench, feature(test))]
-// In general, rust is absolutely horrid at supporting users doing things like,
-// for example, compiling Rust code for real environments. Disable useless lints
-// that don't do anything but annoy us and cant actually ever be resolved.
-#![allow(bare_trait_objects)]
-#![allow(ellipsis_inclusive_range_patterns)]
-#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
+
+// Coding conventions.
+#![warn(missing_docs)]
+
 // Instead of littering the codebase for non-fuzzing code just globally allow.
 #![cfg_attr(hashes_fuzz, allow(dead_code, unused_imports))]
-// Exclude clippy lints we don't think are valuable
+
+// Exclude lints we don't think are valuable.
 #![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
+#![allow(clippy::manual_range_contains)] // More readable than clippy's format.
 
 #[cfg(all(feature = "alloc", not(feature = "std")))]
 extern crate alloc;
@@ -194,6 +194,19 @@ pub trait Hash:
     fn hash(data: &[u8]) -> Self {
         let mut engine = Self::engine();
         engine.input(data);
+        Self::from_engine(engine)
+    }
+
+    /// Hashes all the byte slices retrieved from the iterator together.
+    fn hash_byte_chunks<B, I>(byte_slices: I) -> Self
+    where
+        B: AsRef<[u8]>,
+        I: IntoIterator<Item = B>,
+    {
+        let mut engine = Self::engine();
+        for slice in byte_slices {
+            engine.input(slice.as_ref());
+        }
         Self::from_engine(engine)
     }
 

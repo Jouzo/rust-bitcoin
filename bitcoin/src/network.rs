@@ -29,7 +29,34 @@ use serde::{Deserialize, Serialize};
 use crate::consensus::Params;
 use crate::constants::ChainHash;
 use crate::p2p::Magic;
-use crate::prelude::{String, ToOwned};
+use crate::prelude::*;
+
+/// What kind of network we are on.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NetworkKind {
+    /// The Bitcoin mainnet network.
+    Main,
+    /// Some kind of testnet network.
+    Test,
+}
+
+// We explicitly do not provide `is_testnet`, using `!network.is_mainnet()` is less
+// ambiguous due to confusion caused by signet/testnet/regtest.
+impl NetworkKind {
+    /// Returns true if this is real mainnet bitcoin.
+    pub fn is_mainnet(&self) -> bool { *self == NetworkKind::Main }
+}
+
+impl From<Network> for NetworkKind {
+    fn from(n: Network) -> Self {
+        use Network::*;
+
+        match n {
+            Bitcoin => NetworkKind::Main,
+            Testnet | Signet | Regtest => NetworkKind::Test,
+        }
+    }
+}
 
 /// The cryptocurrency network to act on.
 #[derive(Copy, PartialEq, Eq, PartialOrd, Ord, Clone, Hash, Debug)]
@@ -56,7 +83,6 @@ impl Network {
     /// ```rust
     /// use bitcoin::p2p::Magic;
     /// use bitcoin::Network;
-    /// use std::convert::TryFrom;
     ///
     /// assert_eq!(Ok(Network::Bitcoin), Network::try_from(Magic::from_bytes([0xF9, 0xBE, 0xB4, 0xD9])));
     /// assert_eq!(None, Network::from_magic(Magic::from_bytes([0xFF, 0xFF, 0xFF, 0xFF])));
@@ -137,7 +163,6 @@ impl Network {
     /// ```rust
     /// use bitcoin::Network;
     /// use bitcoin::blockdata::constants::ChainHash;
-    /// use std::convert::TryFrom;
     ///
     /// assert_eq!(Ok(Network::Bitcoin), Network::try_from(ChainHash::BITCOIN));
     /// ```
@@ -161,8 +186,6 @@ impl Network {
 pub mod as_core_arg {
     //! Module for serialization/deserialization of network variants into/from Bitcoin Core values
     #![allow(missing_docs)]
-
-    use serde;
 
     use crate::Network;
 

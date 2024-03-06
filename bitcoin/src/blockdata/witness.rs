@@ -8,12 +8,13 @@
 use core::fmt;
 use core::ops::Index;
 
+use io::{BufRead, Write};
+
 use crate::consensus::encode::{Error, MAX_VEC_SIZE};
 use crate::consensus::{Decodable, Encodable, WriteExt};
 use crate::crypto::ecdsa;
-use crate::io::{self, Read, Write};
+use crate::taproot::{self, TAPROOT_ANNEX_PREFIX};
 use crate::prelude::*;
-use crate::taproot::TAPROOT_ANNEX_PREFIX;
 use crate::{Script, VarInt};
 
 /// The Witness is the data used to unlock bitcoin since the [segwit upgrade].
@@ -26,7 +27,7 @@ use crate::{Script, VarInt};
 /// saving some allocations.
 ///
 /// [segwit upgrade]: <https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki>
-#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Witness {
     /// Contains the witness `Vec<Vec<u8>>` serialization without the initial varint indicating the
     /// number of elements (which is stored in `witness_elements`).
@@ -123,7 +124,7 @@ pub struct Iter<'a> {
 }
 
 impl Decodable for Witness {
-    fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let witness_elements = VarInt::consensus_decode(r)?.0 as usize;
         // Minimum size of witness element is 1 byte, so if the count is
         // greater than MAX_VEC_SIZE we must return an error.
@@ -232,7 +233,14 @@ impl Encodable for Witness {
 
 impl Witness {
     /// Creates a new empty [`Witness`].
-    pub fn new() -> Self { Witness::default() }
+    #[inline]
+    pub const fn new() -> Self {
+        Witness {
+            content: Vec::new(),
+            witness_elements: 0,
+            indices_start: 0,
+        }
+    }
 
     /// Creates a witness required to spend a P2WPKH output.
     ///
@@ -244,6 +252,13 @@ impl Witness {
         let mut witness = Witness::new();
         witness.push_slice(&signature.serialize());
         witness.push_slice(&pubkey.serialize());
+        witness
+    }
+
+    /// Creates a witness required to do a key path spend of a P2TR output.
+    pub fn p2tr_key_spend(signature: &taproot::Signature) -> Witness {
+        let mut witness = Witness::new();
+        witness.push_slice(&signature.serialize());
         witness
     }
 
@@ -535,9 +550,13 @@ impl From<Vec<&[u8]>> for Witness {
     fn from(vec: Vec<&[u8]>) -> Self { Witness::from_slice(&vec) }
 }
 
+impl Default for Witness {
+    fn default() -> Self { Self::new() }
+}
+
 #[cfg(test)]
 mod test {
-    use hex::test_hex_unwrap as hex;
+    use hex::{test_hex_unwrap as hex};
 
     use super::*;
     use crate::consensus::{deserialize, serialize};
@@ -636,9 +655,9 @@ mod test {
         // The very first signature in block 734,958
         let sig_bytes =
             hex!("304402207c800d698f4b0298c5aac830b822f011bb02df41eb114ade9a6702f364d5e39c0220366900d2a60cab903e77ef7dd415d46509b1f78ac78906e3296f495aa1b1b541");
-        let sig = secp256k1::ecdsa::Signature::from_der(&sig_bytes).unwrap();
+        let signature = secp256k1::ecdsa::Signature::from_der(&sig_bytes).unwrap();
         let mut witness = Witness::default();
-        let signature = crate::ecdsa::Signature { sig, hash_ty: EcdsaSighashType::All };
+        let signature = crate::ecdsa::Signature { signature, sighash_type: EcdsaSighashType::All };
         witness.push_ecdsa_signature(&signature);
         let expected_witness = vec![hex!(
             "304402207c800d698f4b0298c5aac830b822f011bb02df41eb114ade9a6702f364d5e39c0220366900d2a60cab903e77ef7dd415d46509b1f78ac78906e3296f495aa1b1b54101")

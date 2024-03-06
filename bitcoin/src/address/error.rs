@@ -6,80 +6,101 @@ use internals::write_err;
 
 use crate::address::{Address, NetworkUnchecked};
 use crate::blockdata::script::{witness_program, witness_version};
-use crate::prelude::String;
-use crate::{base58, Network};
+use crate::prelude::*;
+use crate::Network;
 
-/// Address error.
+/// Address's network differs from required one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// A witness version construction error.
-    WitnessVersion(witness_version::TryFromError),
-    /// A witness program error.
-    WitnessProgram(witness_program::Error),
-    /// An uncompressed pubkey was used where it is not allowed.
-    UncompressedPubkey,
-    /// Address size more than 520 bytes is not allowed.
-    ExcessiveScriptSize,
-    /// Script is not a p2pkh, p2sh or witness program.
-    UnrecognizedScript,
-    /// Address's network differs from required one.
-    NetworkValidation {
-        /// Network that was required.
-        required: Network,
-        /// Network on which the address was found to be valid.
-        found: Network,
-        /// The address itself
-        address: Address<NetworkUnchecked>,
-    },
+pub struct NetworkValidationError {
+    /// Network that was required.
+    pub(crate) required: Network,
+    /// The address itself.
+    pub(crate) address: Address<NetworkUnchecked>,
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for NetworkValidationError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use Error::*;
+        write!(f, "address ")?;
+        fmt::Display::fmt(&self.address.0, f)?;
+        write!(f, " is not valid on {}", self.required)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for NetworkValidationError {}
+
+/// Error while generating address from script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FromScriptError {
+    /// Script is not a p2pkh, p2sh or witness program.
+    UnrecognizedScript,
+    /// A witness program error.
+    WitnessProgram(witness_program::Error),
+    /// A witness version construction error.
+    WitnessVersion(witness_version::TryFromError),
+}
+
+impl fmt::Display for FromScriptError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use FromScriptError::*;
 
         match *self {
             WitnessVersion(ref e) => write_err!(f, "witness version construction error"; e),
             WitnessProgram(ref e) => write_err!(f, "witness program error"; e),
-            UncompressedPubkey =>
-                write!(f, "an uncompressed pubkey was used where it is not allowed"),
-            ExcessiveScriptSize => write!(f, "script size exceed 520 bytes"),
             UnrecognizedScript => write!(f, "script is not a p2pkh, p2sh or witness program"),
-            NetworkValidation { required, found, ref address } => {
-                write!(f, "address ")?;
-                address.fmt_internal(f)?; // Using fmt_internal in order to remove the "Address<NetworkUnchecked>(..)" wrapper
-                write!(
-                    f,
-                    " belongs to network {} which is different from required {}",
-                    found, required
-                )
-            }
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for Error {
+impl std::error::Error for FromScriptError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use Error::*;
+        use FromScriptError::*;
 
-        match self {
-            WitnessVersion(e) => Some(e),
-            WitnessProgram(e) => Some(e),
-            UncompressedPubkey
-            | ExcessiveScriptSize
-            | UnrecognizedScript
-            | NetworkValidation { .. } => None,
+        match *self {
+            UnrecognizedScript => None,
+            WitnessVersion(ref e) => Some(e),
+            WitnessProgram(ref e) => Some(e),
         }
     }
 }
 
-impl From<witness_version::TryFromError> for Error {
-    fn from(e: witness_version::TryFromError) -> Error { Error::WitnessVersion(e) }
+impl From<witness_program::Error> for FromScriptError {
+    fn from(e : witness_program::Error) -> Self { Self::WitnessProgram(e) }
 }
 
-impl From<witness_program::Error> for Error {
-    fn from(e: witness_program::Error) -> Error { Error::WitnessProgram(e) }
+impl From<witness_version::TryFromError> for FromScriptError {
+    fn from(e: witness_version::TryFromError) -> Self { Self::WitnessVersion(e) }
+}
+
+/// Error while generating address from a p2sh script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum P2shError {
+    /// Address size more than 520 bytes is not allowed.
+    ExcessiveScriptSize,
+}
+
+impl fmt::Display for P2shError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use P2shError::*;
+
+        match *self {
+            ExcessiveScriptSize => write!(f, "script size exceed 520 bytes"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for P2shError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use P2shError::*;
+
+        match self {
+            ExcessiveScriptSize => None,
+        }
+    }
 }
 
 /// Address type is either invalid or not supported in rust-bitcoin.
@@ -110,6 +131,8 @@ pub enum ParseError {
     WitnessVersion(witness_version::TryFromError),
     /// A witness program error.
     WitnessProgram(witness_program::Error),
+    /// Tried to parse an unknown HRP.
+    UnknownHrp(UnknownHrpError),
 }
 
 impl fmt::Display for ParseError {
@@ -121,6 +144,7 @@ impl fmt::Display for ParseError {
             Bech32(ref e) => write_err!(f, "bech32 segwit decoding error"; e),
             WitnessVersion(ref e) => write_err!(f, "witness version conversion/parsing error"; e),
             WitnessProgram(ref e) => write_err!(f, "witness program error"; e),
+            UnknownHrp(ref e) => write_err!(f, "tried to parse an unknown hrp"; e),
         }
     }
 }
@@ -135,6 +159,7 @@ impl std::error::Error for ParseError {
             Bech32(ref e) => Some(e),
             WitnessVersion(ref e) => Some(e),
             WitnessProgram(ref e) => Some(e),
+            UnknownHrp(ref e) => Some(e),
         }
     }
 }
@@ -153,4 +178,22 @@ impl From<witness_version::TryFromError> for ParseError {
 
 impl From<witness_program::Error> for ParseError {
     fn from(e: witness_program::Error) -> Self { Self::WitnessProgram(e) }
+}
+
+impl From<UnknownHrpError> for ParseError {
+    fn from(e: UnknownHrpError) -> Self { Self::UnknownHrp(e) }
+}
+
+/// Unknown HRP error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnknownHrpError(pub String);
+
+impl fmt::Display for UnknownHrpError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "unknown hrp: {}", self.0) }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for UnknownHrpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
 }

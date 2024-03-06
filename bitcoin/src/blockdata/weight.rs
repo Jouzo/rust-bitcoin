@@ -5,8 +5,6 @@
 use core::fmt;
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
-use crate::prelude::*;
-
 /// Represents block weight - the weight of a transaction or block.
 ///
 /// This is an integer newtype representing weigth in `wu`. It provides protection against mixing
@@ -63,10 +61,10 @@ impl Weight {
         match vb.checked_mul(Self::WITNESS_SCALE_FACTOR) {
             Some(weight) => Weight(weight),
             None => {
-                // TODO replace with panic!() when MSRV = 1.57+
+                // When MSRV is 1.57+ we can use `panic!()`.
                 #[allow(unconditional_panic)]
-                // disabling this lint until panic!() can be used.
                 #[allow(clippy::let_unit_value)]
+                #[allow(clippy::out_of_bounds_indexing)]
                 let _int_overflow_scaling_weight = [(); 0][1];
                 Weight(0)
             }
@@ -182,6 +180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn from_vb_unchecked_panic() { Weight::from_vb_unchecked(u64::MAX); }
 

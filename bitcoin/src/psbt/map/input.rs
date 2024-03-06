@@ -3,7 +3,7 @@
 use core::fmt;
 use core::str::FromStr;
 
-use hashes::{self, hash160, ripemd160, sha256, sha256d};
+use hashes::{hash160, ripemd160, sha256, sha256d};
 use secp256k1::XOnlyPublicKey;
 
 use crate::bip32::KeySource;
@@ -97,7 +97,6 @@ pub struct Input {
     /// The finalized, fully-constructed scriptWitness with signatures and any
     /// other scripts necessary for this input to pass validation.
     pub final_script_witness: Option<Witness>,
-    /// TODO: Proof of reserves commitment
     /// RIPEMD160 hash to preimage map.
     #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_byte_values"))]
     pub ripemd160_preimages: BTreeMap<ripemd160::Hash, Vec<u8>>,

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: CC0-1.0
 
-use core::convert::{TryFrom, TryInto};
 use core::fmt;
 use core::ops::{
     Bound, Index, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
@@ -10,6 +9,7 @@ use hashes::Hash;
 use secp256k1::{Secp256k1, Verification};
 
 use super::PushBytes;
+use crate::blockdata::fee_rate::FeeRate;
 use crate::blockdata::opcodes::all::*;
 use crate::blockdata::opcodes::{self, Opcode};
 use crate::blockdata::script::witness_version::WitnessVersion;
@@ -18,7 +18,7 @@ use crate::blockdata::script::{
     ScriptHash, WScriptHash,
 };
 use crate::consensus::Encodable;
-use crate::key::{PublicKey, UntweakedPublicKey};
+use crate::key::{PublicKey, UntweakedPublicKey, WPubkeyHash};
 use crate::policy::DUST_RELAY_TX_FEE;
 use crate::prelude::*;
 use crate::taproot::{LeafVersion, TapLeafHash, TapNodeHash};
@@ -59,7 +59,7 @@ use crate::taproot::{LeafVersion, TapLeafHash, TapNodeHash};
 /// ## Memory safety
 ///
 /// The type is `#[repr(transparent)]` for internal purposes only!
-/// No consumer crate may rely on the represenation of the struct!
+/// No consumer crate may rely on the representation of the struct!
 ///
 /// ## References
 ///
@@ -327,14 +327,6 @@ impl Script {
             && self.0[1] == OP_PUSHBYTES_20.to_u8()
     }
 
-    pub(crate) fn p2wpkh(&self) -> Option<&[u8; 20]> {
-        if self.is_p2wpkh() {
-            Some(self.0[2..].try_into().expect("is_v0_p2wpkh checks the length"))
-        } else {
-            None
-        }
-    }
-
     /// Checks whether a script pubkey is a P2TR output.
     #[inline]
     pub fn is_p2tr(&self) -> bool {
@@ -352,7 +344,14 @@ impl Script {
         }
     }
 
-    /// Checks whether a script can be proven to have no satisfying input.
+    /// Checks whether a script is trivially known to have no satisfying input.
+    ///
+    /// This method has potentially confusing semantics and an unclear purpose, so it's going to be
+    /// removed. Use `is_op_return` if you want `OP_RETURN` semantics.
+    #[deprecated(
+        since = "TBD",
+        note = "The method is not very useful, you might want `is_op_return`"
+    )]
     #[inline]
     pub fn is_provably_unspendable(&self) -> bool {
         use crate::blockdata::opcodes::Class::{IllegalOp, ReturnOp};
@@ -376,35 +375,63 @@ impl Script {
     ///
     /// [BIP143]: <https://github.com/bitcoin/bips/blob/99701f68a88ce33b2d0838eb84e115cef505b4c2/bip-0143.mediawiki>
     pub fn p2wpkh_script_code(&self) -> Option<ScriptBuf> {
-        self.p2wpkh().map(|wpkh| {
-            Builder::new()
-                .push_opcode(OP_DUP)
-                .push_opcode(OP_HASH160)
-                // The `self` script is 0x00, 0x14, <pubkey_hash>
-                .push_slice(wpkh)
-                .push_opcode(OP_EQUALVERIFY)
-                .push_opcode(OP_CHECKSIG)
-                .into_script()
-        })
+        if self.is_p2wpkh() {
+            // The `self` script is 0x00, 0x14, <pubkey_hash>
+            let bytes = &self.0[2..];
+            let wpkh = WPubkeyHash::from_slice(bytes).expect("length checked in is_p2wpkh()");
+            Some(ScriptBuf::p2wpkh_script_code(wpkh))
+        } else {
+            None
+        }
     }
 
     /// Returns the minimum value an output with this script should have in order to be
     /// broadcastable on today's Bitcoin network.
-    pub fn dust_value(&self) -> crate::Amount {
+    ///
+    /// Dust depends on the -dustrelayfee value of the Bitcoin Core node you are broadcasting to.
+    /// This function uses the default value of 0.00003 BTC/kB (3 sat/vByte).
+    ///
+    /// To use a custom value, use [`minimal_non_dust_custom`].
+    ///
+    /// [`minimal_non_dust_custom`]: Script::minimal_non_dust_custom
+    pub fn minimal_non_dust(&self) -> crate::Amount {
+        self.minimal_non_dust_inner(DUST_RELAY_TX_FEE.into())
+    }
+
+    /// Returns the minimum value an output with this script should have in order to be
+    /// broadcastable on today's Bitcoin network.
+    ///
+    /// Dust depends on the -dustrelayfee value of the Bitcoin Core node you are broadcasting to.
+    /// This function lets you set the fee rate used in dust calculation.
+    ///
+    /// The current default value in Bitcoin Core (as of v26) is 3 sat/vByte.
+    ///
+    /// To use the default Bitcoin Core value, use [`minimal_non_dust`].
+    ///
+    /// [`minimal_non_dust`]: Script::minimal_non_dust
+    pub fn minimal_non_dust_custom(&self, dust_relay_fee: FeeRate) -> crate::Amount {
+        self.minimal_non_dust_inner(dust_relay_fee.to_sat_per_kwu() * 4)
+    }
+
+    fn minimal_non_dust_inner(&self, dust_relay_fee: u64) -> crate::Amount {
         // This must never be lower than Bitcoin Core's GetDustThreshold() (as of v0.21) as it may
         // otherwise allow users to create transactions which likely can never be broadcast/confirmed.
-        let sats = DUST_RELAY_TX_FEE as u64 / 1000 * // The default dust relay fee is 3000 satoshi/kB (i.e. 3 sat/vByte)
-        if self.is_op_return() {
-            0
-        } else if self.is_witness_program() {
-            32 + 4 + 1 + (107 / 4) + 4 + // The spend cost copied from Core
-            8 + // The serialized size of the TxOut's amount field
-            self.consensus_encode(&mut sink()).expect("sinks don't error") as u64 // The serialized size of this script_pubkey
-        } else {
-            32 + 4 + 1 + 107 + 4 + // The spend cost copied from Core
-            8 + // The serialized size of the TxOut's amount field
-            self.consensus_encode(&mut sink()).expect("sinks don't error") as u64 // The serialized size of this script_pubkey
-        };
+        let sats = dust_relay_fee
+            .checked_mul(if self.is_op_return() {
+                0
+            } else if self.is_witness_program() {
+                32 + 4 + 1 + (107 / 4) + 4 + // The spend cost copied from Core
+                    8 + // The serialized size of the TxOut's amount field
+                    self.consensus_encode(&mut sink()).expect("sinks don't error") as u64 // The serialized size of this script_pubkey
+            } else {
+                32 + 4 + 1 + 107 + 4 + // The spend cost copied from Core
+                    8 + // The serialized size of the TxOut's amount field
+                    self.consensus_encode(&mut sink()).expect("sinks don't error") as u64 // The serialized size of this script_pubkey
+            })
+            .expect("dust_relay_fee or script length should not be absurdly large")
+            / 1000; // divide by 1000 like in Core to get value as it cancels out DEFAULT_MIN_RELAY_TX_FEE
+                    // Note: We ensure the division happens at the end, since Core performs the division at the end.
+                    //       This will make sure none of the implicit floor operations mess with the value.
 
         crate::Amount::from_sat(sats)
     }
@@ -414,7 +441,7 @@ impl Script {
     /// In Bitcoin Core, there are two ways to count sigops, "accurate" and "legacy".
     /// This method uses "accurate" counting. This means that OP_CHECKMULTISIG and its
     /// verify variant count for N sigops where N is the number of pubkeys used in the
-    /// multisig. However, it will count for 20 sigops if CHECKMULTISIG is not preceeded by an
+    /// multisig. However, it will count for 20 sigops if CHECKMULTISIG is not preceded by an
     /// OP_PUSHNUM from 1 - 16 (this would be an invalid script)
     ///
     /// Bitcoin Core uses accurate counting for sigops contained within redeemScripts (P2SH)
@@ -558,22 +585,12 @@ impl Script {
     /// Iterates the script to find the last pushdata.
     ///
     /// Returns `None` if the instruction is an opcode or if the script is empty.
-    pub(crate) fn last_pushdata(&self) -> Option<Push> {
+    pub(crate) fn last_pushdata(&self) -> Option<&PushBytes> {
         match self.instructions().last() {
             // Handles op codes up to (but excluding) OP_PUSHNUM_NEG.
-            Some(Ok(Instruction::PushBytes(bytes))) => Some(Push::Data(bytes)),
+            Some(Ok(Instruction::PushBytes(bytes))) => Some(bytes),
             // OP_16 (0x60) and lower are considered "pushes" by Bitcoin Core (excl. OP_RESERVED).
-            // By here we know that op is between OP_PUSHNUM_NEG AND OP_PUSHNUM_16 inclusive.
-            Some(Ok(Instruction::Op(op))) if op.to_u8() <= 0x60 => {
-                if op == OP_PUSHNUM_NEG1 {
-                    Some(Push::Num(-1))
-                } else if op == OP_RESERVED {
-                    Some(Push::Reserved)
-                } else {
-                    let num = (op.to_u8() - 0x50) as i8; // cast ok, num is [1, 16].
-                    Some(Push::Num(num))
-                }
-            }
+            // However we are only interested in the pushdata so we can ignore them.
             _ => None,
         }
     }
@@ -589,19 +606,6 @@ impl Script {
         let inner = unsafe { Box::from_raw(rw) };
         ScriptBuf(Vec::from(inner))
     }
-}
-
-/// Data pushed by "push" opcodes.
-///
-/// "push" opcodes are defined by Bitcoin Core as OP_PUSHBYTES_, OP_PUSHDATA, OP_PUSHNUM_, and
-/// OP_RESERVED i.e., everything less than OP_PUSHNUM_16 (0x60) . (TODO: Add link to core code).
-pub(crate) enum Push<'a> {
-    /// All the OP_PUSHBYTES_ and OP_PUSHDATA_ opcodes.
-    Data(&'a PushBytes),
-    /// All the OP_PUSHNUM_ opcodes (-1, 1, 2, .., 16)
-    Num(i8),
-    /// OP_RESERVED
-    Reserved,
 }
 
 /// Iterator over bytes of a script

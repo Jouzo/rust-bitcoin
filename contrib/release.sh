@@ -10,11 +10,11 @@ main () {
         if release_changes $crate; then
             echo "$crate has changes implying this is a release PR, checking if we can publish ..."
 
-            # Check if there is any mention of NEXT_RELEASE which means the
+            # Check if there is any mention of TBD which means the
             # next version number should be filled in.
-            if grep -qr NEXT.RELEASE ./$crate; then
+            if grep -qr "since = \"TBD" ./$crate; then
                 echo Version number needs to be filled in following places:
-                grep -r NEXT.RELEASE ./$crate
+                grep -r "since = \"TBD" ./$crate
                 exit 1
             fi
 

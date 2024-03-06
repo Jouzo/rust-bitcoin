@@ -15,17 +15,16 @@
 //! typically big-endian decimals, etc.)
 //!
 
-use core::convert::{From, TryFrom};
 use core::{fmt, mem, u32};
 
 use hashes::{sha256, sha256d, Hash};
 use internals::write_err;
+use io::{Cursor, BufRead, Read, Write};
 
 use crate::bip152::{PrefilledTransaction, ShortId};
-use crate::blockdata::block;
+use crate::bip158::{FilterHash, FilterHeader};
+use crate::blockdata::block::{self, BlockHash, TxMerkleNode};
 use crate::blockdata::transaction::{Transaction, TxIn, TxOut};
-use crate::hash_types::{BlockHash, FilterHash, FilterHeader, TxMerkleNode};
-use crate::io::{self, Cursor, Read};
 #[cfg(feature = "std")]
 use crate::p2p::{
     address::{AddrV2Message, Address},
@@ -138,7 +137,7 @@ pub fn deserialize_partial<T: Decodable>(data: &[u8]) -> Result<(T, usize), Erro
 }
 
 /// Extensions of `Write` to encode data as per Bitcoin consensus.
-pub trait WriteExt: io::Write {
+pub trait WriteExt: Write {
     /// Outputs a 64-bit unsigned integer.
     fn emit_u64(&mut self, v: u64) -> Result<(), io::Error>;
     /// Outputs a 32-bit unsigned integer.
@@ -165,7 +164,7 @@ pub trait WriteExt: io::Write {
 }
 
 /// Extensions of `Read` to decode data as per Bitcoin consensus.
-pub trait ReadExt: io::Read {
+pub trait ReadExt: Read {
     /// Reads a 64-bit unsigned integer.
     fn read_u64(&mut self) -> Result<u64, Error>;
     /// Reads a 32-bit unsigned integer.
@@ -194,7 +193,7 @@ pub trait ReadExt: io::Read {
 macro_rules! encoder_fn {
     ($name:ident, $val_type:ty) => {
         #[inline]
-        fn $name(&mut self, v: $val_type) -> Result<(), io::Error> {
+        fn $name(&mut self, v: $val_type) -> core::result::Result<(), io::Error> {
             self.write_all(&v.to_le_bytes())
         }
     };
@@ -203,7 +202,7 @@ macro_rules! encoder_fn {
 macro_rules! decoder_fn {
     ($name:ident, $val_type:ty, $byte_len: expr) => {
         #[inline]
-        fn $name(&mut self) -> Result<$val_type, Error> {
+        fn $name(&mut self) -> core::result::Result<$val_type, Error> {
             let mut val = [0; $byte_len];
             self.read_exact(&mut val[..]).map_err(Error::Io)?;
             Ok(<$val_type>::from_le_bytes(val))
@@ -211,7 +210,7 @@ macro_rules! decoder_fn {
     };
 }
 
-impl<W: io::Write + ?Sized> WriteExt for W {
+impl<W: Write + ?Sized> WriteExt for W {
     encoder_fn!(emit_u64, u64);
     encoder_fn!(emit_u32, u32);
     encoder_fn!(emit_u16, u16);
@@ -268,7 +267,7 @@ pub trait Encodable {
     ///
     /// The number of bytes written on success. The only errors returned are errors propagated from
     /// the writer.
-    fn consensus_encode<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<usize, io::Error>;
+    fn consensus_encode<W: Write + ?Sized>(&self, writer: &mut W) -> Result<usize, io::Error>;
 }
 
 /// Data which can be encoded in a consensus-consistent way.
@@ -302,7 +301,7 @@ pub trait Decodable: Sized {
     ///   avoid creating redundant `Take` wrappers. Failure to do so might result only in a tiny
     ///   performance hit.
     #[inline]
-    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
+    fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(
         reader: &mut R,
     ) -> Result<Self, Error> {
         // This method is always strictly less general than, `consensus_decode`, so it's safe and
@@ -320,7 +319,7 @@ pub trait Decodable: Sized {
     /// for types that override [`Self::consensus_decode_from_finite_reader`]
     /// instead.
     #[inline]
-    fn consensus_decode<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(reader: &mut R) -> Result<Self, Error> {
         Self::consensus_decode_from_finite_reader(&mut reader.take(MAX_VEC_SIZE as u64))
     }
 }
@@ -358,16 +357,13 @@ macro_rules! impl_int_encodable {
     ($ty:ident, $meth_dec:ident, $meth_enc:ident) => {
         impl Decodable for $ty {
             #[inline]
-            fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+            fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> core::result::Result<Self, Error> {
                 ReadExt::$meth_dec(r)
             }
         }
         impl Encodable for $ty {
             #[inline]
-            fn consensus_encode<W: io::Write + ?Sized>(
-                &self,
-                w: &mut W,
-            ) -> Result<usize, io::Error> {
+            fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> core::result::Result<usize, io::Error> {
                 w.$meth_enc(*self)?;
                 Ok(mem::size_of::<$ty>())
             }
@@ -417,7 +413,7 @@ impl_var_int_from!(u8, u16, u32, u64, usize);
 
 impl Encodable for VarInt {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         match self.0 {
             0..=0xFC => {
                 (self.0 as u8).consensus_encode(w)?;
@@ -444,7 +440,7 @@ impl Encodable for VarInt {
 
 impl Decodable for VarInt {
     #[inline]
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let n = ReadExt::read_u8(r)?;
         match n {
             0xFF => {
@@ -478,7 +474,7 @@ impl Decodable for VarInt {
 
 impl Encodable for bool {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         w.emit_bool(*self)?;
         Ok(1)
     }
@@ -486,14 +482,14 @@ impl Encodable for bool {
 
 impl Decodable for bool {
     #[inline]
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<bool, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<bool, Error> {
         ReadExt::read_bool(r)
     }
 }
 
 impl Encodable for String {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let b = self.as_bytes();
         let vi_len = VarInt(b.len() as u64).consensus_encode(w)?;
         w.emit_slice(b)?;
@@ -503,7 +499,7 @@ impl Encodable for String {
 
 impl Decodable for String {
     #[inline]
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<String, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<String, Error> {
         String::from_utf8(Decodable::consensus_decode(r)?)
             .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
     }
@@ -511,7 +507,7 @@ impl Decodable for String {
 
 impl Encodable for Cow<'static, str> {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let b = self.as_bytes();
         let vi_len = VarInt(b.len() as u64).consensus_encode(w)?;
         w.emit_slice(b)?;
@@ -521,7 +517,7 @@ impl Encodable for Cow<'static, str> {
 
 impl Decodable for Cow<'static, str> {
     #[inline]
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Cow<'static, str>, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Cow<'static, str>, Error> {
         String::from_utf8(Decodable::consensus_decode(r)?)
             .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
             .map(Cow::Owned)
@@ -535,7 +531,7 @@ macro_rules! impl_array {
             fn consensus_encode<W: WriteExt + ?Sized>(
                 &self,
                 w: &mut W,
-            ) -> Result<usize, io::Error> {
+            ) -> core::result::Result<usize, io::Error> {
                 w.emit_slice(&self[..])?;
                 Ok(self.len())
             }
@@ -543,7 +539,7 @@ macro_rules! impl_array {
 
         impl Decodable for [u8; $size] {
             #[inline]
-            fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+            fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> core::result::Result<Self, Error> {
                 let mut ret = [0; $size];
                 r.read_slice(&mut ret)?;
                 Ok(ret)
@@ -564,7 +560,7 @@ impl_array!(33);
 
 impl Decodable for [u16; 8] {
     #[inline]
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let mut res = [0; 8];
         for item in &mut res {
             *item = Decodable::consensus_decode(r)?;
@@ -575,7 +571,7 @@ impl Decodable for [u16; 8] {
 
 impl Encodable for [u16; 8] {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         for c in self.iter() {
             c.consensus_encode(w)?;
         }
@@ -587,10 +583,7 @@ macro_rules! impl_vec {
     ($type: ty) => {
         impl Encodable for Vec<$type> {
             #[inline]
-            fn consensus_encode<W: io::Write + ?Sized>(
-                &self,
-                w: &mut W,
-            ) -> Result<usize, io::Error> {
+            fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> core::result::Result<usize, io::Error> {
                 let mut len = 0;
                 len += VarInt(self.len() as u64).consensus_encode(w)?;
                 for c in self.iter() {
@@ -602,9 +595,9 @@ macro_rules! impl_vec {
 
         impl Decodable for Vec<$type> {
             #[inline]
-            fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
+            fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(
                 r: &mut R,
-            ) -> Result<Self, Error> {
+            ) -> core::result::Result<Self, Error> {
                 let len = VarInt::consensus_decode_from_finite_reader(r)?.0;
                 // Do not allocate upfront more items than if the sequence of type
                 // occupied roughly quarter a block. This should never be the case
@@ -645,7 +638,7 @@ impl_vec!((u32, Address));
 #[cfg(feature = "std")]
 impl_vec!(AddrV2Message);
 
-pub(crate) fn consensus_encode_with_size<W: io::Write + ?Sized>(
+pub(crate) fn consensus_encode_with_size<W: Write + ?Sized>(
     data: &[u8],
     w: &mut W,
 ) -> Result<usize, io::Error> {
@@ -664,7 +657,7 @@ struct ReadBytesFromFiniteReaderOpts {
 /// This function relies on reader being bound in amount of data
 /// it returns for OOM protection. See [`Decodable::consensus_decode_from_finite_reader`].
 #[inline]
-fn read_bytes_from_finite_reader<D: io::Read + ?Sized>(
+fn read_bytes_from_finite_reader<D: Read + ?Sized>(
     d: &mut D,
     mut opts: ReadBytesFromFiniteReaderOpts,
 ) -> Result<Vec<u8>, Error> {
@@ -686,14 +679,14 @@ fn read_bytes_from_finite_reader<D: io::Read + ?Sized>(
 
 impl Encodable for Vec<u8> {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         consensus_encode_with_size(self, w)
     }
 }
 
 impl Decodable for Vec<u8> {
     #[inline]
-    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let len = VarInt::consensus_decode(r)?.0 as usize;
         // most real-world vec of bytes data, wouldn't be larger than 128KiB
         let opts = ReadBytesFromFiniteReaderOpts { len, chunk_size: 128 * 1024 };
@@ -703,14 +696,14 @@ impl Decodable for Vec<u8> {
 
 impl Encodable for Box<[u8]> {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         consensus_encode_with_size(self, w)
     }
 }
 
 impl Decodable for Box<[u8]> {
     #[inline]
-    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         <Vec<u8>>::consensus_decode_from_finite_reader(r).map(From::from)
     }
 }
@@ -723,7 +716,7 @@ fn sha2_checksum(data: &[u8]) -> [u8; 4] {
 
 impl Encodable for CheckedData {
     #[inline]
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         u32::try_from(self.data.len())
             .expect("network message use u32 as length")
             .consensus_encode(w)?;
@@ -735,7 +728,7 @@ impl Encodable for CheckedData {
 
 impl Decodable for CheckedData {
     #[inline]
-    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let len = u32::consensus_decode_from_finite_reader(r)? as usize;
 
         let checksum = <[u8; 4]>::consensus_decode_from_finite_reader(r)?;
@@ -751,19 +744,19 @@ impl Decodable for CheckedData {
 }
 
 impl<'a, T: Encodable> Encodable for &'a T {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         (**self).consensus_encode(w)
     }
 }
 
 impl<'a, T: Encodable> Encodable for &'a mut T {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         (**self).consensus_encode(w)
     }
 }
 
 impl<T: Encodable> Encodable for rc::Rc<T> {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         (**self).consensus_encode(w)
     }
 }
@@ -771,7 +764,7 @@ impl<T: Encodable> Encodable for rc::Rc<T> {
 /// Note: This will fail to compile on old Rust for targets that don't support atomics
 #[cfg(any(not(rust_v_1_60), target_has_atomic = "ptr"))]
 impl<T: Encodable> Encodable for sync::Arc<T> {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         (**self).consensus_encode(w)
     }
 }
@@ -781,10 +774,10 @@ macro_rules! tuple_encode {
         impl <$($x: Encodable),*> Encodable for ($($x),*) {
             #[inline]
             #[allow(non_snake_case)]
-            fn consensus_encode<W: io::Write + ?Sized>(
+            fn consensus_encode<W: Write + ?Sized>(
                 &self,
                 w: &mut W,
-            ) -> Result<usize, io::Error> {
+            ) -> core::result::Result<usize, io::Error> {
                 let &($(ref $x),*) = self;
                 let mut len = 0;
                 $(len += $x.consensus_encode(w)?;)*
@@ -795,7 +788,7 @@ macro_rules! tuple_encode {
         impl<$($x: Decodable),*> Decodable for ($($x),*) {
             #[inline]
             #[allow(non_snake_case)]
-            fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+            fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> core::result::Result<Self, Error> {
                 Ok(($({let $x = Decodable::consensus_decode(r)?; $x }),*))
             }
         }
@@ -811,50 +804,46 @@ tuple_encode!(T0, T1, T2, T3, T4, T5, T6);
 tuple_encode!(T0, T1, T2, T3, T4, T5, T6, T7);
 
 impl Encodable for sha256d::Hash {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         self.as_byte_array().consensus_encode(w)
     }
 }
 
 impl Decodable for sha256d::Hash {
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         Ok(Self::from_byte_array(<<Self as Hash>::Bytes>::consensus_decode(r)?))
     }
 }
 
 impl Encodable for sha256::Hash {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         self.as_byte_array().consensus_encode(w)
     }
 }
 
 impl Decodable for sha256::Hash {
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         Ok(Self::from_byte_array(<<Self as Hash>::Bytes>::consensus_decode(r)?))
     }
 }
 
 impl Encodable for TapLeafHash {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         self.as_byte_array().consensus_encode(w)
     }
 }
 
 impl Decodable for TapLeafHash {
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
         Ok(Self::from_byte_array(<<Self as Hash>::Bytes>::consensus_decode(r)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::fmt;
-    use core::mem::{self, discriminant};
+    use core::mem::discriminant;
 
     use super::*;
-    use crate::consensus::{deserialize_partial, Decodable, Encodable};
-    #[cfg(feature = "std")]
-    use crate::p2p::{message_blockdata::Inventory, Address};
 
     #[test]
     fn serialize_int_test() {
@@ -1025,7 +1014,6 @@ mod tests {
     #[test]
     fn serialize_vector_test() {
         assert_eq!(serialize(&vec![1u8, 2, 3]), vec![3u8, 1, 2, 3]);
-        // TODO: test vectors of more interesting objects
     }
 
     #[test]

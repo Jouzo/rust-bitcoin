@@ -9,16 +9,16 @@
 use core::fmt::{self, LowerHex, UpperHex};
 use core::ops::{Add, Div, Mul, Not, Rem, Shl, Shr, Sub};
 
+use io::{BufRead, Write};
 #[cfg(all(test, mutate))]
 use mutagen::mutate;
 
+use crate::blockdata::block::BlockHash;
 use crate::consensus::encode::{self, Decodable, Encodable};
 #[cfg(doc)]
 use crate::consensus::Params;
-use crate::hash_types::BlockHash;
-use crate::io::{self, Read, Write};
-use crate::prelude::String;
 use crate::string::FromHexStr;
+use crate::prelude::*;
 use crate::Network;
 
 /// Implement traits and methods shared by `Target` and `Work`.
@@ -44,17 +44,17 @@ macro_rules! do_impl {
 
         impl fmt::Display for $ty {
             #[inline]
-            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result { fmt::Display::fmt(&self.0, f) }
         }
 
         impl fmt::LowerHex for $ty {
             #[inline]
-            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
         }
 
         impl fmt::UpperHex for $ty {
             #[inline]
-            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
         }
     };
 }
@@ -301,7 +301,7 @@ impl Encodable for CompactTarget {
 
 impl Decodable for CompactTarget {
     #[inline]
-    fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
         u32::consensus_decode(r).map(CompactTarget)
     }
 }
@@ -442,7 +442,6 @@ impl U256 {
             [self.1 as u64, (self.1 >> 64) as u64, self.0 as u64, (self.0 >> 64) as u64];
 
         for word in &mut split_le {
-            // TODO: Use `carrying_mul` when stabilized: https://github.com/rust-lang/rust/issues/85532
             // This will not overflow, for proof see https://github.com/rust-bitcoin/rust-bitcoin/pull/1496#issuecomment-1365938572
             let n = carry + u128::from(rhs) * u128::from(*word);
 
@@ -810,7 +809,7 @@ impl fmt::Debug for U256 {
 macro_rules! impl_hex {
     ($hex:ident, $case:expr) => {
         impl $hex for U256 {
-            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn fmt(&self, f: &mut fmt::Formatter) -> core::fmt::Result {
                 hex::fmt_hex_exact!(f, 32, &self.to_be_bytes(), $case)
             }
         }
@@ -832,7 +831,6 @@ impl crate::serde::Serialize for U256 {
         }
 
         if serializer.is_human_readable() {
-            // TODO: fast hex encoding.
             serializer.collect_str(&DisplayHex(*self))
         } else {
             let bytes = self.to_be_bytes();
@@ -1676,13 +1674,13 @@ mod tests {
     }
 
     #[test]
-    fn u256_wrapping_add_wraps_at_boundry() {
+    fn u256_wrapping_add_wraps_at_boundary() {
         assert_eq!(U256::MAX.wrapping_add(U256::ONE), U256::ZERO);
         assert_eq!(U256::MAX.wrapping_add(U256::from(2_u8)), U256::ONE);
     }
 
     #[test]
-    fn u256_wrapping_sub_wraps_at_boundry() {
+    fn u256_wrapping_sub_wraps_at_boundary() {
         assert_eq!(U256::ZERO.wrapping_sub(U256::ONE), U256::MAX);
         assert_eq!(U256::ONE.wrapping_sub(U256::from(2_u8)), U256::MAX);
     }
@@ -1694,22 +1692,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn u256_overflowing_addition_panics() { let _ = U256::MAX + U256::ONE; }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn u256_overflowing_subtraction_panics() { let _ = U256::ZERO - U256::ONE; }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn u256_multiplication_by_max_panics() { let _ = U256::MAX * U256::MAX; }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn work_overflowing_addition_panics() { let _ = Work(U256::MAX) + Work(U256::ONE); }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn work_overflowing_subtraction_panics() { let _ = Work(U256::ZERO) - Work(U256::ONE); }
 
@@ -1735,7 +1738,6 @@ mod tests {
 mod verification {
     use super::*;
 
-    // TODO: After we verify div_rem assert x * y / y == x
     #[kani::unwind(5)] // mul_u64 loops over 4 64 bit ints so use one more than 4
     #[kani::proof]
     fn check_mul_u64() {

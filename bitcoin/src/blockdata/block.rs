@@ -10,28 +10,44 @@
 
 use core::fmt;
 
-use hashes::{Hash, HashEngine};
+use hashes::{sha256d, Hash, HashEngine};
+use io::{BufRead, Write};
 
 use super::Weight;
 use crate::blockdata::script;
-use crate::blockdata::transaction::Transaction;
+use crate::blockdata::transaction::{Transaction, Txid, Wtxid};
 use crate::consensus::{encode, Decodable, Encodable};
-use crate::hash_types::{TxMerkleNode, WitnessCommitment, WitnessMerkleNode, Wtxid};
-use crate::internal_macros::impl_consensus_encoding;
+use crate::internal_macros::{impl_consensus_encoding, impl_hashencode};
 use crate::pow::{CompactTarget, Target, Work};
 use crate::prelude::*;
-use crate::{io, merkle_tree, Network, VarInt};
+use crate::{merkle_tree, Network, VarInt};
 
-#[rustfmt::skip]                // Keep public re-exports separate.
-#[doc(inline)]
-pub use crate::{
-    hash_types::BlockHash,
-};
+hashes::hash_newtype! {
+    /// A bitcoin block hash.
+    pub struct BlockHash(sha256d::Hash);
+    /// A hash of the Merkle tree branch or root for transactions.
+    pub struct TxMerkleNode(sha256d::Hash);
+    /// A hash corresponding to the Merkle tree root for witness data.
+    pub struct WitnessMerkleNode(sha256d::Hash);
+    /// A hash corresponding to the witness structure commitment in the coinbase transaction.
+    pub struct WitnessCommitment(sha256d::Hash);
+}
+impl_hashencode!(BlockHash);
+impl_hashencode!(TxMerkleNode);
+impl_hashencode!(WitnessMerkleNode);
+
+impl From<Txid> for TxMerkleNode {
+    fn from(txid: Txid) -> Self { Self::from_byte_array(txid.to_byte_array()) }
+}
+
+impl From<Wtxid> for WitnessMerkleNode {
+    fn from(wtxid: Wtxid) -> Self { Self::from_byte_array(wtxid.to_byte_array()) }
+}
 
 /// Bitcoin block header.
 ///
 /// Contains all the block's information except the actual transactions, but
-/// including a root of a [merkle tree] commiting to all transactions in the block.
+/// including a root of a [merkle tree] committing to all transactions in the block.
 ///
 /// [merkle tree]: https://en.wikipedia.org/wiki/Merkle_tree
 ///
@@ -169,7 +185,8 @@ impl Version {
     /// Creates a [`Version`] from a signed 32 bit integer value.
     ///
     /// This is the data type used in consensus code in Bitcoin Core.
-    pub fn from_consensus(v: i32) -> Self { Version(v) }
+    #[inline]
+    pub const fn from_consensus(v: i32) -> Self { Version(v) }
 
     /// Returns the inner `i32` value.
     ///
@@ -201,13 +218,13 @@ impl Default for Version {
 }
 
 impl Encodable for Version {
-    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         self.0.consensus_encode(w)
     }
 }
 
 impl Decodable for Version {
-    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
         Decodable::consensus_decode(r).map(Version)
     }
 }
@@ -289,7 +306,7 @@ impl Block {
 
     /// Computes the transaction merkle root.
     pub fn compute_merkle_root(&self) -> Option<TxMerkleNode> {
-        let hashes = self.txdata.iter().map(|obj| obj.txid().to_raw_hash());
+        let hashes = self.txdata.iter().map(|obj| obj.compute_txid().to_raw_hash());
         merkle_tree::calculate_root(hashes).map(|h| h.into())
     }
 
@@ -311,7 +328,7 @@ impl Block {
                 // Replace the first hash with zeroes.
                 Wtxid::all_zeros().to_raw_hash()
             } else {
-                t.wtxid().to_raw_hash()
+                t.compute_wtxid().to_raw_hash()
             }
         });
         merkle_tree::calculate_root(hashes).map(|h| h.into())
@@ -491,7 +508,7 @@ mod tests {
         let block: Block = deserialize(&hex!(BLOCK_HEX)).unwrap();
 
         let cb_txid = "d574f343976d8e70d91cb278d21044dd8a396019e6db70755a0a50e4783dba38";
-        assert_eq!(block.coinbase().unwrap().txid().to_string(), cb_txid);
+        assert_eq!(block.coinbase().unwrap().compute_txid().to_string(), cb_txid);
 
         assert_eq!(block.bip34_block_height(), Ok(100_000));
 
@@ -533,7 +550,6 @@ mod tests {
         );
         assert_eq!(real_decode.header.difficulty(network), 1);
         assert_eq!(real_decode.header.difficulty_float(), 1.0);
-        // [test] TODO: check the transaction data
 
         assert_eq!(real_decode.total_size(), some_block.len());
         assert_eq!(real_decode.base_size(), some_block.len());
@@ -575,7 +591,6 @@ mod tests {
         );
         assert_eq!(real_decode.header.difficulty(network), 2456598);
         assert_eq!(real_decode.header.difficulty_float(), 2456598.4399242126);
-        // [test] TODO: check the transaction data
 
         assert_eq!(real_decode.total_size(), segwit_block.len());
         assert_eq!(real_decode.base_size(), 4283);
@@ -657,11 +672,11 @@ mod tests {
 
 #[cfg(bench)]
 mod benches {
+    use io::sink;
     use test::{black_box, Bencher};
 
     use super::Block;
     use crate::consensus::{deserialize, Decodable, Encodable};
-    use crate::io::sink;
 
     #[bench]
     pub fn bench_stream_reader(bh: &mut Bencher) {

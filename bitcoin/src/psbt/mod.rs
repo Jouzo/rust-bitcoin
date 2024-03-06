@@ -23,7 +23,7 @@ use internals::write_err;
 use secp256k1::{Message, Secp256k1, Signing};
 
 use crate::bip32::{self, KeySource, Xpriv, Xpub};
-use crate::blockdata::transaction::{Transaction, TxOut};
+use crate::blockdata::transaction::{self, Transaction, TxOut};
 use crate::crypto::ecdsa;
 use crate::crypto::key::{PrivateKey, PublicKey};
 use crate::prelude::*;
@@ -371,8 +371,10 @@ impl Psbt {
                 Ok((msg, sighash_ty)) => (msg, sighash_ty),
             };
 
-            let sig =
-                ecdsa::Signature { sig: secp.sign_ecdsa(&msg, &sk.inner), hash_ty: sighash_ty };
+            let sig = ecdsa::Signature {
+                signature: secp.sign_ecdsa(&msg, &sk.inner),
+                sighash_type: sighash_ty,
+            };
 
             let pk = sk.public_key(secp);
 
@@ -407,14 +409,17 @@ impl Psbt {
 
         match self.output_type(input_index)? {
             Bare => {
-                let sighash = cache.legacy_signature_hash(input_index, spk, hash_ty.to_u32())?;
+                let sighash = cache
+                    .legacy_signature_hash(input_index, spk, hash_ty.to_u32())
+                    .expect("input checked above");
                 Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
             }
             Sh => {
                 let script_code =
                     input.redeem_script.as_ref().ok_or(SignError::MissingRedeemScript)?;
-                let sighash =
-                    cache.legacy_signature_hash(input_index, script_code, hash_ty.to_u32())?;
+                let sighash = cache
+                    .legacy_signature_hash(input_index, script_code, hash_ty.to_u32())
+                    .expect("input checked above");
                 Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
             }
             Wpkh => {
@@ -431,7 +436,7 @@ impl Psbt {
                 let witness_script =
                     input.witness_script.as_ref().ok_or(SignError::MissingWitnessScript)?;
                 let sighash =
-                    cache.p2wsh_signature_hash(input_index, witness_script, utxo.value, hash_ty)?;
+                    cache.p2wsh_signature_hash(input_index, witness_script, utxo.value, hash_ty).map_err(SignError::SegwitV0Sighash)?;
                 Ok((Message::from_digest(sighash.to_byte_array()), hash_ty))
             }
             Tr => {
@@ -765,8 +770,10 @@ pub enum SignError {
     NotEcdsa,
     /// The `scriptPubkey` is not a P2WPKH script.
     NotWpkh,
-    /// Sighash computation error.
-    SighashComputation(sighash::Error),
+    /// Sighash computation error (segwit v0 input).
+    SegwitV0Sighash(transaction::InputsIndexError),
+    /// Sighash computation error (p2wpkh input).
+    P2wpkhSighash(sighash::P2wpkhError),
     /// Unable to determine the output type.
     UnknownOutputType,
     /// Unable to find key.
@@ -791,7 +798,8 @@ impl fmt::Display for SignError {
             MismatchedAlgoKey => write!(f, "signing algorithm and key type does not match"),
             NotEcdsa => write!(f, "attempted to ECDSA sign an non-ECDSA input"),
             NotWpkh => write!(f, "the scriptPubkey is not a P2WPKH script"),
-            SighashComputation(ref e) => write!(f, "sighash: {}", e),
+            SegwitV0Sighash(ref e) => write_err!(f, "segwit v0 sighash"; e),
+            P2wpkhSighash(ref e) => write_err!(f, "p2wpkh sighash"; e),
             UnknownOutputType => write!(f, "unable to determine the output type"),
             KeyNotFound => write!(f, "unable to find key"),
             WrongSigningAlgorithm =>
@@ -807,7 +815,8 @@ impl std::error::Error for SignError {
         use SignError::*;
 
         match *self {
-            SighashComputation(ref e) => Some(e),
+            SegwitV0Sighash(ref e) => Some(e),
+            P2wpkhSighash(ref e) => Some(e),
             IndexOutOfBounds(ref e) => Some(e),
             InvalidSighashType
             | MissingInputUtxo
@@ -825,8 +834,8 @@ impl std::error::Error for SignError {
     }
 }
 
-impl From<sighash::Error> for SignError {
-    fn from(e: sighash::Error) -> Self { SignError::SighashComputation(e) }
+impl From<sighash::P2wpkhError> for SignError {
+    fn from(e: sighash::P2wpkhError) -> Self { Self::P2wpkhSighash(e) }
 }
 
 impl From<IndexOutOfBoundsError> for SignError {
@@ -1000,23 +1009,18 @@ pub use self::display_from_str::PsbtParseError;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use hashes::{hash160, ripemd160, sha256, Hash};
+    use hashes::{hash160, ripemd160, sha256};
     use hex::{test_hex_unwrap as hex, FromHex};
-    use secp256k1::{self, Secp256k1};
     #[cfg(feature = "rand-std")]
     use secp256k1::{All, SecretKey};
 
     use super::*;
-    use crate::bip32::{ChildNumber, KeySource, Xpriv, Xpub};
+    use crate::bip32::ChildNumber;
     use crate::blockdata::locktime::absolute;
     use crate::blockdata::script::ScriptBuf;
-    use crate::blockdata::transaction::{self, OutPoint, Sequence, Transaction, TxIn, TxOut};
+    use crate::blockdata::transaction::{self, OutPoint, Sequence, TxIn};
     use crate::blockdata::witness::Witness;
-    use crate::network::Network::Bitcoin;
-    use crate::psbt::map::{Input, Output};
-    use crate::psbt::raw;
+    use crate::network::NetworkKind;
     use crate::psbt::serialize::{Deserialize, Serialize};
 
     #[track_caller]
@@ -1153,7 +1157,7 @@ mod tests {
 
         let mut hd_keypaths: BTreeMap<secp256k1::PublicKey, KeySource> = Default::default();
 
-        let mut sk: Xpriv = Xpriv::new_master(Bitcoin, &seed).unwrap();
+        let mut sk: Xpriv = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
 
         let fprint = sk.fingerprint(secp);
 
@@ -1296,7 +1300,7 @@ mod tests {
             vec![(raw::Key { type_value: 1, key: vec![0, 1] }, vec![3, 4, 5])]
                 .into_iter()
                 .collect();
-        let key_source = ("deadbeef".parse().unwrap(), "m/0'/1".parse().unwrap());
+        let key_source = ("deadbeef".parse().unwrap(), "0'/1".parse().unwrap());
         let keypaths: BTreeMap<secp256k1::PublicKey, KeySource> = vec![(
             "0339880dc92394b7355e3d0439fa283c31de7590812ea011c4245c0674a685e883".parse().unwrap(),
             key_source.clone(),
@@ -1373,18 +1377,11 @@ mod tests {
     }
 
     mod bip_vectors {
-        use std::collections::BTreeMap;
         #[cfg(feature = "base64")]
         use std::str::FromStr;
 
         use super::*;
-        use crate::blockdata::locktime::absolute;
-        use crate::blockdata::script::ScriptBuf;
-        use crate::blockdata::transaction::{OutPoint, Sequence, Transaction, TxIn, TxOut};
-        use crate::blockdata::witness::Witness;
-        use crate::psbt::map::{Input, Map, Output};
-        use crate::psbt::{raw, Psbt};
-        use crate::sighash::EcdsaSighashType;
+        use crate::psbt::map::Map;
 
         #[test]
         #[should_panic(expected = "InvalidMagic")]
@@ -1594,7 +1591,7 @@ mod tests {
             let tx_input = &psbt.unsigned_tx.input[0];
             let psbt_non_witness_utxo = psbt.inputs[0].non_witness_utxo.as_ref().unwrap();
 
-            assert_eq!(tx_input.previous_output.txid, psbt_non_witness_utxo.txid());
+            assert_eq!(tx_input.previous_output.txid, psbt_non_witness_utxo.compute_txid());
             assert!(psbt_non_witness_utxo.output[tx_input.previous_output.vout as usize]
                 .script_pubkey
                 .is_p2pkh());
@@ -1661,7 +1658,7 @@ mod tests {
 
             let tx = &psbt.unsigned_tx;
             assert_eq!(
-                tx.txid(),
+                tx.compute_txid(),
                 "75c5c9665a570569ad77dd1279e6fd4628a093c4dcbf8d41532614044c14c115".parse().unwrap(),
             );
 
@@ -1940,7 +1937,7 @@ mod tests {
         let secp = Secp256k1::new();
 
         let sk = SecretKey::new(&mut thread_rng());
-        let priv_key = PrivateKey::new(sk, crate::Network::Regtest);
+        let priv_key = PrivateKey::new(sk, NetworkKind::Test);
         let pk = PublicKey::from_private_key(&secp, &priv_key);
 
         (priv_key, pk, secp)
@@ -2105,7 +2102,7 @@ mod tests {
         psbt.inputs[0].bip32_derivation = map;
 
         // Second input is unspendable by us e.g., from another wallet that supports future upgrades.
-        let unknown_prog = WitnessProgram::new(WitnessVersion::V4, vec![0xaa; 34]).unwrap();
+        let unknown_prog = WitnessProgram::new(WitnessVersion::V4, &[0xaa; 34]).unwrap();
         let txout_unknown_future = TxOut {
             value: Amount::from_sat(10),
             script_pubkey: ScriptBuf::new_witness_program(&unknown_prog),
