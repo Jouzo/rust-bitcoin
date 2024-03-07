@@ -43,7 +43,7 @@ macro_rules! impl_consensus_encoding {
         }
     );
 }
-pub(crate) use impl_consensus_encoding;
+pub use impl_consensus_encoding;
 
 /// Implements several traits for byte-based newtypes.
 /// Implements:
